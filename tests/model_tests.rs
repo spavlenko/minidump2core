@@ -3,13 +3,13 @@ use md2core::notes::build_prpsinfo;
 
 // --- Group 1: build_prpsinfo byte layout ---
 
-/// AArch64 uses u16 for pr_uid and pr_gid (prpsinfo_uid_is_u32 returns false).
-/// Prefix layout (AArch64, long_size=8):
-///   pr_state(1) + pr_sname(1) + pr_zomb(1) + pr_nice(1) = 4 bytes
+/// `AArch64` uses u16 for `pr_uid` and `pr_gid` (`prpsinfo_uid_is_u32` returns false).
+/// Prefix layout (`AArch64`, `long_size` = 8):
+///   `pr_state`(1) + `pr_sname`(1) + `pr_zomb`(1) + `pr_nice`(1) = 4 bytes
 ///   pad to next 8-byte boundary → 4 pad bytes → total 8
-///   pr_flag (8 bytes) → total 16
-///   pr_uid (u16, 2 bytes) at offset 16
-///   pr_gid (u16, 2 bytes) at offset 18
+///   `pr_flag` (8 bytes) → total 16
+///   `pr_uid` (u16, 2 bytes) at offset 16
+///   `pr_gid` (u16, 2 bytes) at offset 18
 #[test]
 fn prpsinfo_aarch64_uid_gid_are_u16() {
     let info = ProcessInfo::new();
@@ -34,16 +34,20 @@ fn prpsinfo_aarch64_uid_gid_are_u16() {
     );
     // Verify total size: 8 (header+pad) + 8 (pr_flag) + 2 (uid) + 2 (gid)
     //                  + 16 (pids) + 16 (filename) + 80 (args) = 132
-    assert_eq!(bytes.len(), 132, "AArch64 prpsinfo descriptor should be 132 bytes");
+    assert_eq!(
+        bytes.len(),
+        132,
+        "AArch64 prpsinfo descriptor should be 132 bytes"
+    );
 }
 
-/// X86_64 uses u32 for pr_uid and pr_gid (prpsinfo_uid_is_u32 returns true).
-/// Prefix layout (X86_64, long_size=8):
-///   pr_state(1) + pr_sname(1) + pr_zomb(1) + pr_nice(1) = 4 bytes
+/// `X86_64` uses u32 for `pr_uid` and `pr_gid` (`prpsinfo_uid_is_u32` returns true).
+/// Prefix layout (`X86_64`, `long_size` = 8):
+///   `pr_state`(1) + `pr_sname`(1) + `pr_zomb`(1) + `pr_nice`(1) = 4 bytes
 ///   pad to next 8-byte boundary → 4 pad bytes → total 8
-///   pr_flag (8 bytes) → total 16
-///   pr_uid (u32, 4 bytes) at offset 16
-///   pr_gid (u32, 4 bytes) at offset 20
+///   `pr_flag` (8 bytes) → total 16
+///   `pr_uid` (u32, 4 bytes) at offset 16
+///   `pr_gid` (u32, 4 bytes) at offset 20
 #[test]
 fn prpsinfo_x86_64_uid_gid_are_u32() {
     let info = ProcessInfo::new();
@@ -65,11 +69,15 @@ fn prpsinfo_x86_64_uid_gid_are_u32() {
         "pr_gid at offset 20 should be u32 (4 bytes)"
     );
     // Verify total size: 8 + 8 + 4 + 4 + 16 + 16 + 80 = 136
-    assert_eq!(bytes.len(), 136, "X86_64 prpsinfo descriptor should be 136 bytes");
+    assert_eq!(
+        bytes.len(),
+        136,
+        "X86_64 prpsinfo descriptor should be 136 bytes"
+    );
 }
 
-/// AArch64 (u16 uid/gid) and X86_64 (u32 uid/gid) have different descriptor sizes.
-/// Both share long_size=8, but uid+gid size differs: 4 vs 8 bytes → total differs by 4.
+/// `AArch64` (u16 uid/gid) and `X86_64` (u32 uid/gid) have different descriptor sizes.
+/// Both share `long_size` = 8, but uid+gid size differs: 4 vs 8 bytes → total differs by 4.
 #[test]
 fn prpsinfo_descriptor_sizes_differ_by_arch() {
     let info = ProcessInfo::new();

@@ -2,6 +2,7 @@ use crate::error::Md2CoreError;
 use crate::model::{Mapping, MappingPermissions};
 
 /// Returns true when a byte stream looks like `/proc/<pid>/maps` text.
+#[must_use]
 pub fn looks_like_linux_maps(data: &[u8]) -> bool {
     if data.len() <= 17 {
         return false;
@@ -12,6 +13,10 @@ pub fn looks_like_linux_maps(data: &[u8]) -> bool {
 }
 
 /// Parses the subset of Linux maps lines used by Breakpad md2core.
+///
+/// # Errors
+///
+/// Returns an error if the data is not valid UTF-8 or if a maps line cannot be parsed.
 pub fn parse_linux_maps(data: &[u8]) -> Result<Vec<Mapping>, Md2CoreError> {
     let text = std::str::from_utf8(data).map_err(|_| Md2CoreError::InvalidUtf8 {
         stream: "MD_LINUX_MAPS",

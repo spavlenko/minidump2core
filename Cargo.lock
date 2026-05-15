@@ -393,10 +393,10 @@ dependencies = [
  "memmap2",
  "minidump-common",
  "num-traits",
- "procfs-core 0.17.0",
+ "procfs-core",
  "prost",
  "range-map",
- "scroll 0.12.0",
+ "scroll",
  "thiserror",
  "time",
  "tracing",
@@ -414,7 +414,7 @@ dependencies = [
  "num-derive",
  "num-traits",
  "range-map",
- "scroll 0.12.0",
+ "scroll",
  "smart-default",
 ]
 
@@ -425,9 +425,9 @@ dependencies = [
  "clap",
  "minidump",
  "minidump-common",
- "procfs-core 0.18.0",
+ "procfs-core",
  "proptest",
- "scroll 0.13.0",
+ "scroll",
  "thiserror",
 ]
 
@@ -514,16 +514,6 @@ name = "procfs-core"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "239df02d8349b06fc07398a3a1697b06418223b1c7725085e801e7c0fc6a12ec"
-dependencies = [
- "bitflags",
- "hex",
-]
-
-[[package]]
-name = "procfs-core"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6401bf7b6af22f78b563665d15a22e9aef27775b79b149a66ca022468a4e405"
 dependencies = [
  "bitflags",
  "hex",
@@ -690,12 +680,6 @@ checksum = "6ab8598aa408498679922eff7fa985c25d58a90771bd6be794434c5277eab1a6"
 dependencies = [
  "scroll_derive",
 ]
-
-[[package]]
-name = "scroll"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1257cd4248b4132760d6524d6dda4e053bc648c9070b960929bf50cfb1e7add"
 
 [[package]]
 name = "scroll_derive"

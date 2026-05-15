@@ -34,9 +34,9 @@ pub mod note_types {
     /// Auxiliary vector.
     pub const NT_AUXV: u32 = 6;
     /// File-backed memory mappings (PIE displacement + automatic so-file detection in GDB).
-    pub const NT_FILE: u32 = 0x46494c45;
+    pub const NT_FILE: u32 = 0x4649_4c45;
     /// x86 extended FP registers.
-    pub const NT_PRXFPREG: u32 = 0x46e62b7f;
+    pub const NT_PRXFPREG: u32 = 0x46e6_2b7f;
 }
 
 /// Note name prefix used by GNU/Linux core notes.
@@ -58,16 +58,22 @@ pub struct ElfHeader {
 
 impl ElfHeader {
     /// Returns the on-disk size of the header for the configured class.
+    #[must_use]
     pub const fn size(self) -> u32 {
         if self.class == 2 { 64 } else { 52 }
     }
 
     /// Returns the on-disk size of one program header for the configured class.
+    #[must_use]
     pub const fn phdr_size(self) -> u16 {
         if self.class == 2 { 56 } else { 32 }
     }
 
     /// Writes the executable header into `out` in little-endian byte order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing to `out` fails.
     pub fn write<W: Write>(&self, out: &mut W) -> Result<(), Md2CoreError> {
         let mut e_ident = [0u8; 16];
         e_ident[..4].copy_from_slice(&ELFMAG);
@@ -77,10 +83,10 @@ impl ElfHeader {
         out.write_all(&e_ident)?;
         out.write_all(&ET_CORE.to_le_bytes())?;
         out.write_all(&self.machine.to_le_bytes())?;
-        out.write_all(&(EV_CURRENT as u32).to_le_bytes())?;
+        out.write_all(&u32::from(EV_CURRENT).to_le_bytes())?;
 
-        let ehsize = self.size() as u64;
-        let phentsize = self.phdr_size() as u64;
+        let ehsize = u64::from(self.size());
+        let phentsize = u64::from(self.phdr_size());
         let shentsize: u64 = if self.class == 2 { 64 } else { 40 };
 
         if self.class == 2 {
@@ -90,26 +96,26 @@ impl ElfHeader {
             out.write_all(&0u64.to_le_bytes())?;
         } else {
             out.write_all(&0u32.to_le_bytes())?;
-            out.write_all(&(ehsize as u32).to_le_bytes())?;
+            out.write_all(&u32::try_from(ehsize).unwrap_or(0).to_le_bytes())?;
             out.write_all(&0u32.to_le_bytes())?;
         }
 
         out.write_all(&0u32.to_le_bytes())?; // e_flags
-        out.write_all(&(ehsize as u16).to_le_bytes())?; // e_ehsize
-        out.write_all(&(phentsize as u16).to_le_bytes())?;
+        out.write_all(&u16::try_from(ehsize).unwrap_or(0).to_le_bytes())?; // e_ehsize
+        out.write_all(&u16::try_from(phentsize).unwrap_or(0).to_le_bytes())?;
         out.write_all(&self.phnum.to_le_bytes())?;
-        out.write_all(&(shentsize as u16).to_le_bytes())?;
+        out.write_all(&u16::try_from(shentsize).unwrap_or(0).to_le_bytes())?;
         out.write_all(&0u16.to_le_bytes())?; // e_shnum
         out.write_all(&0u16.to_le_bytes())?; // e_shstrndx
         Ok(())
     }
 }
 
-/// One ELF program header entry. Fields use 64-bit storage; the writer
-/// truncates to 32 bits for `ELFCLASS32`.
+/// One ELF program header entry. Fields use 64-bit storage; the writer rejects
+/// values that cannot be represented in `ELFCLASS32`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProgramHeader {
-    /// `p_type` (PT_NOTE / PT_LOAD).
+    /// `p_type` (`PT_NOTE` / `PT_LOAD`).
     pub p_type: u32,
     /// `p_flags`.
     pub p_flags: u32,
@@ -129,6 +135,10 @@ pub struct ProgramHeader {
 
 impl ProgramHeader {
     /// Writes the header into `out` matching the chosen ELF class.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing to `out` fails.
     pub fn write<W: Write>(&self, out: &mut W, class: u8) -> Result<(), Md2CoreError> {
         if class == 2 {
             out.write_all(&self.p_type.to_le_bytes())?;
@@ -141,16 +151,20 @@ impl ProgramHeader {
             out.write_all(&self.p_align.to_le_bytes())?;
         } else {
             out.write_all(&self.p_type.to_le_bytes())?;
-            out.write_all(&(self.p_offset as u32).to_le_bytes())?;
-            out.write_all(&(self.p_vaddr as u32).to_le_bytes())?;
-            out.write_all(&(self.p_paddr as u32).to_le_bytes())?;
-            out.write_all(&(self.p_filesz as u32).to_le_bytes())?;
-            out.write_all(&(self.p_memsz as u32).to_le_bytes())?;
+            out.write_all(&elf32_word(self.p_offset, "ELF32 p_offset")?.to_le_bytes())?;
+            out.write_all(&elf32_word(self.p_vaddr, "ELF32 p_vaddr")?.to_le_bytes())?;
+            out.write_all(&elf32_word(self.p_paddr, "ELF32 p_paddr")?.to_le_bytes())?;
+            out.write_all(&elf32_word(self.p_filesz, "ELF32 p_filesz")?.to_le_bytes())?;
+            out.write_all(&elf32_word(self.p_memsz, "ELF32 p_memsz")?.to_le_bytes())?;
             out.write_all(&self.p_flags.to_le_bytes())?;
-            out.write_all(&(self.p_align as u32).to_le_bytes())?;
+            out.write_all(&elf32_word(self.p_align, "ELF32 p_align")?.to_le_bytes())?;
         }
         Ok(())
     }
+}
+
+fn elf32_word(value: u64, field: &'static str) -> Result<u32, Md2CoreError> {
+    u32::try_from(value).map_err(|_| Md2CoreError::IntegerOverflow(field))
 }
 
 /// ELF note header (`Elf32_Nhdr` / `Elf64_Nhdr` — both 12 bytes, identical).
@@ -166,6 +180,10 @@ pub struct NoteHeader {
 
 impl NoteHeader {
     /// Writes the 12-byte note header to `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing to `out` fails.
     pub fn write<W: Write>(&self, out: &mut W) -> Result<(), Md2CoreError> {
         out.write_all(&self.n_namesz.to_le_bytes())?;
         out.write_all(&self.n_descsz.to_le_bytes())?;
@@ -175,6 +193,7 @@ impl NoteHeader {
 }
 
 /// Pads `bytes` upward to the next multiple of `align` with zeros.
+#[must_use]
 pub fn align_to(bytes: usize, align: usize) -> usize {
     let rem = bytes % align;
     if rem == 0 { 0 } else { align - rem }

@@ -9,10 +9,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
+use md2core::Md2CoreError;
 use md2core::augment::augment_process;
 use md2core::core_writer::write_core;
-use md2core::rust_minidump::{read_process_from_path, ConvertOptions};
-use md2core::Md2CoreError;
+use md2core::rust_minidump::{ConvertOptions, read_process_from_path};
 
 /// Convert a Breakpad minidump (Linux/Android) into an ELF core file readable
 /// by gdb. Mirrors the original C++ tool's command-line surface.
@@ -75,19 +75,16 @@ fn run(cli: &Cli) -> Result<(), Md2CoreError> {
     let mut process = read_process_from_path(&cli.minidump, &options)?;
     augment_process(&mut process, cli.verbose)?;
 
-    match &cli.output {
-        Some(path) => {
-            let file = File::create(path)?;
-            let mut out = BufWriter::new(file);
-            write_core(&process, &mut out)?;
-            out.flush()?;
-        }
-        None => {
-            let stdout = io::stdout();
-            let mut out = BufWriter::new(stdout.lock());
-            write_core(&process, &mut out)?;
-            out.flush()?;
-        }
+    if let Some(path) = &cli.output {
+        let file = File::create(path)?;
+        let mut out = BufWriter::new(file);
+        write_core(&process, &mut out)?;
+        out.flush()?;
+    } else {
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        write_core(&process, &mut out)?;
+        out.flush()?;
     }
     Ok(())
 }

@@ -26,6 +26,7 @@ pub enum Architecture {
 
 impl Architecture {
     /// Returns the ELF class (`ELFCLASS32` = 1 / `ELFCLASS64` = 2).
+    #[must_use]
     pub const fn elf_class(self) -> u8 {
         match self {
             Self::X86 | Self::Arm | Self::Mips => 1,
@@ -34,35 +35,37 @@ impl Architecture {
     }
 
     /// Returns the ELF `e_machine` constant.
+    #[must_use]
     pub const fn elf_machine(self) -> u16 {
         match self {
-            Self::X86 => 3,        // EM_386
-            Self::X86_64 => 62,    // EM_X86_64
-            Self::Arm => 40,       // EM_ARM
-            Self::Aarch64 => 183,  // EM_AARCH64
+            Self::X86 => 3,                 // EM_386
+            Self::X86_64 => 62,             // EM_X86_64
+            Self::Arm => 40,                // EM_ARM
+            Self::Aarch64 => 183,           // EM_AARCH64
             Self::Mips | Self::Mips64 => 8, // EM_MIPS
         }
     }
 
     /// Returns true when the target is a 64-bit ELF class.
+    #[must_use]
     pub const fn is_64bit(self) -> bool {
         self.elf_class() == 2
     }
 
     /// Word size of `unsigned long` for prstatus/prpsinfo layouts.
+    #[must_use]
     pub const fn long_size(self) -> usize {
         if self.is_64bit() { 8 } else { 4 }
     }
 
     /// Whether `pr_uid`/`pr_gid` are 32-bit on this arch (matching Breakpad).
+    #[must_use]
     pub const fn prpsinfo_uid_is_u32(self) -> bool {
-        matches!(
-            self,
-            Self::X86_64 | Self::Mips | Self::Mips64,
-        )
+        matches!(self, Self::X86_64 | Self::Mips | Self::Mips64,)
     }
 
     /// Short human-readable name for diagnostics.
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::X86 => "x86",
@@ -85,34 +88,57 @@ pub struct MappingPermissions {
 
 impl MappingPermissions {
     /// Creates a permission set from explicit bits.
+    #[must_use]
     pub const fn new(read: bool, write: bool, execute: bool) -> Self {
-        Self { read, write, execute }
+        Self {
+            read,
+            write,
+            execute,
+        }
     }
 
     /// Creates readable and writable permissions for synthetic data mappings.
+    #[must_use]
     pub const fn read_write() -> Self {
         Self::new(true, true, false)
     }
 
     /// Read-only permissions used as a fallback for module mappings discovered
     /// via `MD_MODULE_LIST_STREAM` without companion `/proc/.../maps`.
+    #[must_use]
     pub const fn read_only() -> Self {
         Self::new(true, false, false)
     }
 
     /// Returns true when the mapping is readable.
-    pub const fn is_readable(self) -> bool { self.read }
+    #[must_use]
+    pub const fn is_readable(self) -> bool {
+        self.read
+    }
     /// Returns true when the mapping is writable.
-    pub const fn is_writable(self) -> bool { self.write }
+    #[must_use]
+    pub const fn is_writable(self) -> bool {
+        self.write
+    }
     /// Returns true when the mapping is executable.
-    pub const fn is_executable(self) -> bool { self.execute }
+    #[must_use]
+    pub const fn is_executable(self) -> bool {
+        self.execute
+    }
 
     /// Converts this set to ELF `p_flags` bits.
+    #[must_use]
     pub const fn to_elf_flags(self) -> u32 {
         let mut flags = 0;
-        if self.execute { flags |= 1; }
-        if self.write { flags |= 2; }
-        if self.read { flags |= 4; }
+        if self.execute {
+            flags |= 1;
+        }
+        if self.write {
+            flags |= 2;
+        }
+        if self.read {
+            flags |= 4;
+        }
         flags
     }
 }
@@ -136,6 +162,10 @@ pub struct Mapping {
 
 impl Mapping {
     /// Creates an anonymous mapping with no associated core-file bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `start_address >= end_address`.
     pub fn new(
         start_address: u64,
         end_address: u64,
@@ -158,11 +188,13 @@ impl Mapping {
     }
 
     /// Returns true when `addr` lies inside this mapping.
+    #[must_use]
     pub fn contains(&self, addr: u64) -> bool {
         self.start_address <= addr && addr < self.end_address
     }
 
     /// Attaches a file backing path and file offset.
+    #[must_use]
     pub fn with_file(mut self, filename: String, offset: u64) -> Self {
         self.filename = Some(filename);
         self.offset = offset;
@@ -194,16 +226,17 @@ pub struct ProcessInfo {
 
 impl ProcessInfo {
     /// Creates an empty process info record.
+    #[must_use]
     pub const fn new() -> Self {
-        Self { filename: [0; 16], arguments: [0; 80] }
+        Self {
+            filename: [0; 16],
+            arguments: [0; 80],
+        }
     }
 
     /// Applies Breakpad's command-line normalization rules.
     pub fn apply_cmdline(&mut self, cmdline: &[u8]) {
-        let Some(end) = cmdline
-            .iter()
-            .position(|byte| *byte == 0 || *byte == b' ')
-        else {
+        let Some(end) = cmdline.iter().position(|byte| *byte == 0 || *byte == b' ') else {
             return;
         };
 
@@ -220,13 +253,17 @@ impl ProcessInfo {
         let arg_len = cmdline.len().min(79);
         self.arguments[..arg_len].copy_from_slice(&cmdline[..arg_len]);
         for byte in &mut self.arguments[..arg_len] {
-            if *byte == 0 { *byte = b' '; }
+            if *byte == 0 {
+                *byte = b' ';
+            }
         }
     }
 }
 
 impl Default for ProcessInfo {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Subset of `MD_LINUX_DSO_DEBUG` data needed to rebuild an `r_debug` link map.
@@ -275,7 +312,7 @@ pub struct CrashedProcess {
     pub exception_context: Option<MinidumpRawContext>,
     /// Fatal signal number associated with the crash, if known.
     pub fatal_signal: i32,
-    /// Optional DSO debug data for r_debug reconstruction.
+    /// Optional DSO debug data for `r_debug` reconstruction.
     pub dso_debug: DsoDebug,
     /// Mapping module-name overrides keyed by base address (used by `-i` /
     /// `--mangle-sonames` to substitute symbol-server style names).
@@ -284,6 +321,7 @@ pub struct CrashedProcess {
 
 impl CrashedProcess {
     /// Creates a process model for a validated target architecture.
+    #[must_use]
     pub fn new(architecture: Architecture) -> Self {
         Self {
             architecture,
@@ -300,11 +338,19 @@ impl CrashedProcess {
     }
 
     /// Returns the architecture selected during system validation.
-    pub const fn architecture(&self) -> Architecture { self.architecture }
+    #[must_use]
+    pub const fn architecture(&self) -> Architecture {
+        self.architecture
+    }
     /// Returns the ordered mapping table.
-    pub fn mappings(&self) -> &BTreeMap<u64, Mapping> { &self.mappings }
+    #[must_use]
+    pub fn mappings(&self) -> &BTreeMap<u64, Mapping> {
+        &self.mappings
+    }
     /// Mutable access to the mapping table for late-stage augmentation.
-    pub fn mappings_mut(&mut self) -> &mut BTreeMap<u64, Mapping> { &mut self.mappings }
+    pub fn mappings_mut(&mut self) -> &mut BTreeMap<u64, Mapping> {
+        &mut self.mappings
+    }
     /// Inserts or replaces one mapping by its start address. If the address
     /// already exists, the existing entry is preserved (matching Breakpad's
     /// preference for `MD_LINUX_MAPS` over `MD_MODULE_LIST_STREAM`).
@@ -313,37 +359,66 @@ impl CrashedProcess {
     }
     /// Inserts a mapping only if no mapping at that start address exists.
     pub fn insert_mapping_if_absent(&mut self, mapping: Mapping) {
-        self.mappings.entry(mapping.start_address).or_insert(mapping);
+        self.mappings
+            .entry(mapping.start_address)
+            .or_insert(mapping);
     }
     /// Appends a thread snapshot.
-    pub fn add_thread(&mut self, thread: ThreadSnapshot) { self.threads.push(thread); }
+    pub fn add_thread(&mut self, thread: ThreadSnapshot) {
+        self.threads.push(thread);
+    }
     /// Returns all thread snapshots.
-    pub fn threads(&self) -> &[ThreadSnapshot] { &self.threads }
+    #[must_use]
+    pub fn threads(&self) -> &[ThreadSnapshot] {
+        &self.threads
+    }
     /// Sets the raw auxiliary vector bytes.
-    pub fn set_auxv(&mut self, auxv: Vec<u8>) { self.auxv = auxv; }
+    pub fn set_auxv(&mut self, auxv: Vec<u8>) {
+        self.auxv = auxv;
+    }
     /// Returns the raw auxiliary vector bytes.
-    pub fn auxv(&self) -> &[u8] { &self.auxv }
+    #[must_use]
+    pub fn auxv(&self) -> &[u8] {
+        &self.auxv
+    }
     /// Updates process info from the Linux command-line stream.
-    pub fn apply_cmdline(&mut self, cmdline: &[u8]) { self.process_info.apply_cmdline(cmdline); }
+    pub fn apply_cmdline(&mut self, cmdline: &[u8]) {
+        self.process_info.apply_cmdline(cmdline);
+    }
     /// Returns process info note data.
-    pub const fn process_info(&self) -> &ProcessInfo { &self.process_info }
+    #[must_use]
+    pub const fn process_info(&self) -> &ProcessInfo {
+        &self.process_info
+    }
 }
 
 /// Aligns `value` upward to the next multiple of `alignment`.
+///
+/// # Errors
+///
+/// Returns an error if `alignment` is zero or if the alignment overflows `u64`.
 pub fn align_up(value: u64, alignment: u64) -> Result<u64, Md2CoreError> {
     if alignment == 0 {
         return Err(Md2CoreError::InvalidAlignment);
     }
     let remainder = value % alignment;
-    if remainder == 0 { return Ok(value); }
+    if remainder == 0 {
+        return Ok(value);
+    }
     value
         .checked_add(alignment - remainder)
         .ok_or(Md2CoreError::IntegerOverflow("aligned value"))
 }
 
 /// Aligns `value` downward to a multiple of `alignment`.
+///
+/// # Errors
+///
+/// Returns an error if `alignment` is zero.
 pub fn align_down(value: u64, alignment: u64) -> Result<u64, Md2CoreError> {
-    if alignment == 0 { return Err(Md2CoreError::InvalidAlignment); }
+    if alignment == 0 {
+        return Err(Md2CoreError::InvalidAlignment);
+    }
     Ok(value - (value % alignment))
 }
 
@@ -352,7 +427,9 @@ pub(crate) fn padded_vec(
     data: &[u8],
     alignment: usize,
 ) -> Result<Vec<u8>, Md2CoreError> {
-    if alignment == 0 { return Err(Md2CoreError::InvalidAlignment); }
+    if alignment == 0 {
+        return Err(Md2CoreError::InvalidAlignment);
+    }
     let initial_len = prefix_len
         .checked_add(data.len())
         .ok_or(Md2CoreError::IntegerOverflow("padded data length"))?;

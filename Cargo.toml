@@ -6,19 +6,23 @@ description = "Safe Rust port of Breakpad's minidump-2-core tool"
 license = "BSD-3-Clause"
 keywords = ["minidump", "coredump", "breakpad", "linux", "debugger"]
 categories = ["command-line-utilities", "development-tools::debugging"]
-rust-version = "1.75"
+rust-version = "1.89"
 repository = "https://github.com/spavlenko/minidump2core"
 
 [[bin]]
 name = "minidump-2-core"
 path = "src/main.rs"
 
+[lib]
+name = "md2core"
+path = "src/lib.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 minidump = "0.26.1"
 minidump-common = "0.26.1"
-procfs-core = { version = "0.18", default-features = false }
-scroll = "0.13.0"
+procfs-core = { version = "0.17", default-features = false }
+scroll = "0.12"
 thiserror = "2"
 
 [dev-dependencies]

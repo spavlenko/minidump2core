@@ -1,5 +1,5 @@
-use md2core::linux_maps::{looks_like_linux_maps, parse_linux_maps};
 use md2core::Md2CoreError;
+use md2core::linux_maps::{looks_like_linux_maps, parse_linux_maps};
 
 #[test]
 fn parses_absolute_file_mappings_and_permissions() {
@@ -78,7 +78,10 @@ fn parse_maps_excludes_empty_filename() {
     // Five fields, no sixth (filename) field.
     let input = b"7f001000-7f002000 rw-p 00000000 00:00 0\n";
     let mappings = parse_linux_maps(input).unwrap();
-    assert!(mappings.is_empty(), "mapping without filename should be excluded");
+    assert!(
+        mappings.is_empty(),
+        "mapping without filename should be excluded"
+    );
 }
 
 /// Lines with `/path/foo.so (deleted)` should be included because the filename starts with `/`.
@@ -88,12 +91,13 @@ fn parse_maps_excludes_empty_filename() {
 fn parse_maps_includes_deleted_files() {
     let input = b"7f001000-7f002000 r-xp 00000000 08:02 1234 /lib/foo.so (deleted)\n";
     let mappings = parse_linux_maps(input).unwrap();
-    assert_eq!(mappings.len(), 1, "mapping with /path (deleted) should be included");
-    // The parser takes only the first whitespace token as the filename.
     assert_eq!(
-        mappings[0].filename.as_deref(),
-        Some("/lib/foo.so")
+        mappings.len(),
+        1,
+        "mapping with /path (deleted) should be included"
     );
+    // The parser takes only the first whitespace token as the filename.
+    assert_eq!(mappings[0].filename.as_deref(), Some("/lib/foo.so"));
 }
 
 /// A line with a non-zero file offset should parse and preserve that offset.
@@ -102,9 +106,9 @@ fn parse_maps_handles_nonzero_offset() {
     let input = b"7f001000-7f002000 r--p 00020000 08:02 1234 /lib/foo.so\n";
     let mappings = parse_linux_maps(input).unwrap();
     assert_eq!(mappings.len(), 1);
-    assert_eq!(mappings[0].offset, 0x00020000);
-    assert_eq!(mappings[0].start_address, 0x7f001000);
-    assert_eq!(mappings[0].end_address, 0x7f002000);
+    assert_eq!(mappings[0].offset, 0x0002_0000);
+    assert_eq!(mappings[0].start_address, 0x7f00_1000);
+    assert_eq!(mappings[0].end_address, 0x7f00_2000);
 }
 
 /// A malformed line (missing the range field entirely) should return an error.
@@ -116,7 +120,6 @@ fn parse_maps_rejects_malformed_line() {
     let result = parse_linux_maps(input);
     assert!(
         matches!(result, Err(Md2CoreError::InvalidMapsLine(_))),
-        "malformed line should return InvalidMapsLine error, got: {:?}",
-        result
+        "malformed line should return InvalidMapsLine error, got: {result:?}"
     );
 }

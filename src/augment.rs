@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 
 use crate::error::Md2CoreError;
 use crate::model::{
-    align_down, align_up, padded_vec, Architecture, CrashedProcess, DsoDebug, Mapping,
-    MappingPermissions, DEFAULT_PAGE_SIZE,
+    Architecture, CrashedProcess, DEFAULT_PAGE_SIZE, DsoDebug, Mapping, MappingPermissions,
+    align_down, align_up, padded_vec,
 };
 
 /// Address of the synthetic page used to host the rebuilt link map. Matches
@@ -15,6 +15,10 @@ use crate::model::{
 pub const LINK_MAP_ADDR: u64 = 4096;
 
 /// Adds a captured byte blob to the mapping table, splitting mappings as needed.
+///
+/// # Errors
+///
+/// Returns an error if address arithmetic overflows or the mapping data is too large.
 pub fn add_data_to_mapping(
     mappings: &mut BTreeMap<u64, Mapping>,
     data: &[u8],
@@ -38,15 +42,15 @@ pub fn add_data_to_mapping(
             .cloned()
             .ok_or(Md2CoreError::MissingField("mapping"))?;
 
-        if aligned_address != key {
-            if let Some(existing) = mappings.get_mut(&key) {
-                existing.end_address = aligned_address;
-                if data_mapping.filename.is_some() {
-                    data_mapping.offset = data_mapping
-                        .offset
-                        .checked_add(aligned_address - key)
-                        .ok_or(Md2CoreError::IntegerOverflow("split mapping offset"))?;
-                }
+        if aligned_address != key
+            && let Some(existing) = mappings.get_mut(&key)
+        {
+            existing.end_address = aligned_address;
+            if data_mapping.filename.is_some() {
+                data_mapping.offset = data_mapping
+                    .offset
+                    .checked_add(aligned_address - key)
+                    .ok_or(Md2CoreError::IntegerOverflow("split mapping offset"))?;
             }
         }
 
@@ -73,8 +77,12 @@ pub fn add_data_to_mapping(
 /// Performs the full md2core augmentation pass:
 ///   * Inject each thread's stack bytes into the mapping table.
 ///   * Rebuild a `r_debug` + `link_map[]` blob at [`LINK_MAP_ADDR`].
-///   * Patch the DT_DEBUG entry in the captured `_DYNAMIC` data to point at
+///   * Patch the `DT_DEBUG` entry in the captured `_DYNAMIC` data to point at
 ///     the rebuilt link map and inject the patched data at its original VA.
+///
+/// # Errors
+///
+/// Returns an error if address arithmetic overflows or a mapping operation fails.
 pub fn augment_process(process: &mut CrashedProcess, verbose: bool) -> Result<(), Md2CoreError> {
     let arch = process.architecture();
 
@@ -87,7 +95,10 @@ pub fn augment_process(process: &mut CrashedProcess, verbose: bool) -> Result<()
     for (addr, stack) in &stacks {
         if !stack.is_empty() {
             if verbose {
-                eprintln!("md2core: augment: injecting stack at {addr:#018x} ({} bytes)", stack.len());
+                eprintln!(
+                    "md2core: augment: injecting stack at {addr:#018x} ({} bytes)",
+                    stack.len()
+                );
             }
             add_data_to_mapping(process.mappings_mut(), stack, *addr, DEFAULT_PAGE_SIZE)?;
         }
@@ -104,12 +115,17 @@ pub fn augment_process(process: &mut CrashedProcess, verbose: bool) -> Result<()
                 blob.len(),
             );
         }
-        add_data_to_mapping(process.mappings_mut(), &blob, LINK_MAP_ADDR, DEFAULT_PAGE_SIZE)?;
+        add_data_to_mapping(
+            process.mappings_mut(),
+            &blob,
+            LINK_MAP_ADDR,
+            DEFAULT_PAGE_SIZE,
+        )?;
 
         // 3. Patch and inject _DYNAMIC.
         if !dso.dynamic_data.is_empty() && dso.dynamic != 0 {
             let mut dyn_data = dso.dynamic_data.clone();
-            patch_dt_debug(arch, &mut dyn_data, LINK_MAP_ADDR);
+            patch_dt_debug(arch, &mut dyn_data, LINK_MAP_ADDR)?;
             if verbose {
                 eprintln!(
                     "md2core: augment: patched _DYNAMIC ({} bytes) at {:#018x}",
@@ -117,7 +133,12 @@ pub fn augment_process(process: &mut CrashedProcess, verbose: bool) -> Result<()
                     dso.dynamic,
                 );
             }
-            add_data_to_mapping(process.mappings_mut(), &dyn_data, dso.dynamic, DEFAULT_PAGE_SIZE)?;
+            add_data_to_mapping(
+                process.mappings_mut(),
+                &dyn_data,
+                dso.dynamic,
+                DEFAULT_PAGE_SIZE,
+            )?;
         }
     } else if verbose {
         eprintln!("md2core: augment: no DSO debug info, skipping link_map");
@@ -141,7 +162,11 @@ const DT_DEBUG: u64 = 21;
 
 /// Patches the first `DT_DEBUG` entry in `dynamic_data` in place so its
 /// `d_un.d_ptr` field points at `link_map_addr`.
-fn patch_dt_debug(arch: Architecture, dynamic_data: &mut [u8], link_map_addr: u64) {
+fn patch_dt_debug(
+    arch: Architecture,
+    dynamic_data: &mut [u8],
+    link_map_addr: u64,
+) -> Result<(), Md2CoreError> {
     let entry = if arch.is_64bit() { 16 } else { 8 };
     let mut offset = 0;
     while offset + entry <= dynamic_data.len() {
@@ -149,14 +174,19 @@ fn patch_dt_debug(arch: Architecture, dynamic_data: &mut [u8], link_map_addr: u6
         if tag == DT_DEBUG {
             // d_un follows d_tag in memory.
             let value_off = offset + entry / 2;
-            write_word(arch, &mut dynamic_data[value_off..value_off + entry / 2], link_map_addr);
-            return;
+            write_word(
+                arch,
+                &mut dynamic_data[value_off..value_off + entry / 2],
+                link_map_addr,
+            )?;
+            return Ok(());
         }
         if tag == DT_NULL {
-            return;
+            return Ok(());
         }
         offset += entry;
     }
+    Ok(())
 }
 
 fn read_word_pair(arch: Architecture, bytes: &[u8]) -> (u64, u64) {
@@ -165,18 +195,21 @@ fn read_word_pair(arch: Architecture, bytes: &[u8]) -> (u64, u64) {
         let value = u64::from_le_bytes(bytes[8..16].try_into().unwrap_or([0; 8]));
         (tag, value)
     } else {
-        let tag = u32::from_le_bytes(bytes[0..4].try_into().unwrap_or([0; 4])) as u64;
-        let value = u32::from_le_bytes(bytes[4..8].try_into().unwrap_or([0; 4])) as u64;
+        let tag = u64::from(u32::from_le_bytes(bytes[0..4].try_into().unwrap_or([0; 4])));
+        let value = u64::from(u32::from_le_bytes(bytes[4..8].try_into().unwrap_or([0; 4])));
         (tag, value)
     }
 }
 
-fn write_word(arch: Architecture, slot: &mut [u8], value: u64) {
+fn write_word(arch: Architecture, slot: &mut [u8], value: u64) -> Result<(), Md2CoreError> {
     if arch.is_64bit() {
         slot[..8].copy_from_slice(&value.to_le_bytes());
     } else {
-        slot[..4].copy_from_slice(&(value as u32).to_le_bytes());
+        let value = u32::try_from(value)
+            .map_err(|_| Md2CoreError::IntegerOverflow("32-bit dynamic word"))?;
+        slot[..4].copy_from_slice(&value.to_le_bytes());
     }
+    Ok(())
 }
 
 /// Builds the `r_debug` + sequence of `link_map` records + name strings.
@@ -192,12 +225,16 @@ fn build_link_map_blob(
     let mut data = Vec::new();
 
     // r_debug
-    push_word(&mut data, dso.version as u64, word); // r_version (int but stored at long width for natural alignment on 64-bit)
-    let r_map = if dso.link_map.is_empty() { 0 } else { LINK_MAP_ADDR + r_debug_size as u64 };
-    push_word(&mut data, r_map, word); // r_map
-    push_word(&mut data, dso.brk, word); // r_brk
-    push_word(&mut data, 0, word); // r_state = RT_CONSISTENT (stored at long width)
-    push_word(&mut data, dso.ldbase, word); // r_ldbase
+    push_word(&mut data, u64::from(dso.version), word)?; // r_version (int but stored at long width for natural alignment on 64-bit)
+    let r_map = if dso.link_map.is_empty() {
+        0
+    } else {
+        LINK_MAP_ADDR + r_debug_size as u64
+    };
+    push_word(&mut data, r_map, word)?; // r_map
+    push_word(&mut data, dso.brk, word)?; // r_brk
+    push_word(&mut data, 0, word)?; // r_state = RT_CONSISTENT (stored at long width)
+    push_word(&mut data, dso.ldbase, word)?; // r_ldbase
     debug_assert_eq!(data.len(), r_debug_size);
 
     // link_map records, with their name strings appended after each record.
@@ -213,20 +250,28 @@ fn build_link_map_blob(
             // Address of the previous link_map record.
             // We compute it as: LINK_MAP_ADDR + (current data offset - previous record size).
             // Tracked via a running address below for clarity.
-            link_map_record_addr(LINK_MAP_ADDR, &data, link_map_size, filename_padded_size(&dso.link_map[i - 1].name_for(signatures)))
+            link_map_record_addr(
+                LINK_MAP_ADDR,
+                &data,
+                link_map_size,
+                filename_padded_size(&dso.link_map[i - 1].name_for(signatures)),
+            )
         };
         let next = if i + 1 == dso.link_map.len() {
             0
         } else {
             // Next record starts after current (link_map_size + padded_name_size).
-            LINK_MAP_ADDR + data.len() as u64 + link_map_size as u64 + filename_padded_size(&filename)
+            LINK_MAP_ADDR
+                + data.len() as u64
+                + link_map_size as u64
+                + filename_padded_size(&filename)
         };
 
-        push_word(&mut data, entry.addr, word);   // l_addr
-        push_word(&mut data, name_offset, word);  // l_name (pointer into our blob)
-        push_word(&mut data, entry.ld, word);     // l_ld
-        push_word(&mut data, next, word);         // l_next
-        push_word(&mut data, prev, word);         // l_prev
+        push_word(&mut data, entry.addr, word)?; // l_addr
+        push_word(&mut data, name_offset, word)?; // l_name (pointer into our blob)
+        push_word(&mut data, entry.ld, word)?; // l_ld
+        push_word(&mut data, next, word)?; // l_next
+        push_word(&mut data, prev, word)?; // l_prev
 
         let name_bytes = filename.as_bytes();
         data.extend_from_slice(name_bytes);
@@ -238,7 +283,7 @@ fn build_link_map_blob(
     Ok(data)
 }
 
-/// Computes the address of a link_map record placed just before the current
+/// Computes the address of a `link_map` record placed just before the current
 /// data tail, given the size of the previous filename block.
 fn link_map_record_addr(
     base: u64,
@@ -270,10 +315,13 @@ impl LinkNameLookup for crate::model::LinkMapEntry {
     }
 }
 
-fn push_word(out: &mut Vec<u8>, value: u64, word: usize) {
+fn push_word(out: &mut Vec<u8>, value: u64, word: usize) -> Result<(), Md2CoreError> {
     if word == 8 {
         out.extend_from_slice(&value.to_le_bytes());
     } else {
-        out.extend_from_slice(&(value as u32).to_le_bytes());
+        let value = u32::try_from(value)
+            .map_err(|_| Md2CoreError::IntegerOverflow("32-bit link-map word"))?;
+        out.extend_from_slice(&value.to_le_bytes());
     }
+    Ok(())
 }

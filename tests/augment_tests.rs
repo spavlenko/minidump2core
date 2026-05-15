@@ -34,14 +34,23 @@ fn add_data_splits_existing_file_mapping_at_page_boundary() {
         "data mapping end_address should equal the original mapping's end_address"
     );
     // The data mapping inherits permissions from the original mapping (r-xp).
-    assert!(data_mapping.permissions.is_readable(), "data mapping should be readable");
-    assert!(!data_mapping.permissions.is_writable(), "data mapping should not be writable");
-    assert!(data_mapping.permissions.is_executable(), "data mapping should be executable");
+    assert!(
+        data_mapping.permissions.is_readable(),
+        "data mapping should be readable"
+    );
+    assert!(
+        !data_mapping.permissions.is_writable(),
+        "data mapping should not be writable"
+    );
+    assert!(
+        data_mapping.permissions.is_executable(),
+        "data mapping should be executable"
+    );
 }
 
 proptest! {
     #[test]
-    fn synthetic_mapping_data_is_page_aligned(address in 0u64..0x100000, data in proptest::collection::vec(any::<u8>(), 0..8192)) {
+    fn synthetic_mapping_data_is_page_aligned(address in 0u64..0x0010_0000, data in proptest::collection::vec(any::<u8>(), 0..8192)) {
         let mut mappings = BTreeMap::new();
         add_data_to_mapping(&mut mappings, &data, address, 4096)
             .map_err(|err| TestCaseError::fail(err.to_string()))?;

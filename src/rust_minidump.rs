@@ -17,7 +17,7 @@ use minidump_common::format::{
     DSO_DEBUG_32, DSO_DEBUG_64, LINK_MAP_32, LINK_MAP_64, MINIDUMP_STREAM_TYPE,
 };
 use procfs_core::process::MMapPath;
-use scroll::{Pread, LE};
+use scroll::{LE, Pread};
 
 use crate::error::Md2CoreError;
 use crate::linux_maps::{looks_like_linux_maps, parse_linux_maps};
@@ -39,6 +39,10 @@ pub struct ConvertOptions {
 }
 
 /// Reads a minidump from disk and converts the supported streams.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or if the minidump format is invalid or unsupported.
 pub fn read_process_from_path(
     path: impl AsRef<Path>,
     options: &ConvertOptions,
@@ -58,6 +62,11 @@ pub fn read_process_from_path(
 /// it is required to walk the link-map array referenced by an
 /// `MD_LINUX_DSO_DEBUG` stream because that data lives outside the stream's
 /// own descriptor.
+///
+/// # Errors
+///
+/// Returns an error if any required stream is missing, malformed, or uses an
+/// unsupported OS/CPU combination.
 pub fn read_process_from_minidump<'a, T>(
     dump: &'a Minidump<'a, T>,
     full_file: &[u8],
@@ -71,16 +80,73 @@ where
     let system_info = dump.get_stream::<MinidumpSystemInfo>()?;
     let architecture = architecture_from_system_info(&system_info)?;
     if v {
-        eprintln!("md2core: system info: os={}, cpu={}", system_info.os, system_info.cpu);
+        eprintln!(
+            "md2core: system info: os={}, cpu={}",
+            system_info.os, system_info.cpu
+        );
     }
     let mut process = CrashedProcess::new(architecture);
 
+    ingest_linux_streams(dump, &mut process, v)?;
+
+    ingest_threads(dump, &mut process, &system_info, v);
+
+    // Modules — supplement mappings, build signature substitutions.
+    match dump.get_stream::<MinidumpModuleList>() {
+        Ok(modules) => {
+            if v {
+                eprintln!("md2core: module list: {} modules", modules.iter().count());
+                for m in modules.iter() {
+                    eprintln!("md2core:   {:#018x}  {}", m.raw.base_of_image, m.name,);
+                }
+            }
+            ingest_modules(&mut process, &modules, options);
+        }
+        Err(_) => {
+            if v {
+                eprintln!("md2core: module list: not present");
+            }
+        }
+    }
+
+    ingest_exception(dump, &mut process, &system_info, v);
+
+    // DSO debug — link_map reconstruction.
+    if let Some(bytes) = optional_raw_stream(dump, MINIDUMP_STREAM_TYPE::LinuxDsoDebug)? {
+        if v {
+            eprintln!("md2core: MD_LINUX_DSO_DEBUG: {} bytes", bytes.len());
+        }
+        process.dso_debug = parse_dso_debug(architecture, bytes, full_file)?;
+        if v {
+            eprintln!(
+                "md2core: DSO debug: {} link_map entries",
+                process.dso_debug.link_map.len(),
+            );
+        }
+    } else if v {
+        eprintln!("md2core: MD_LINUX_DSO_DEBUG: not present");
+    }
+
+    Ok(process)
+}
+
+fn ingest_linux_streams<'a, T>(
+    dump: &'a Minidump<'a, T>,
+    process: &mut CrashedProcess,
+    v: bool,
+) -> Result<(), Md2CoreError>
+where
+    T: Deref<Target = [u8]> + 'a,
+{
     // Memory mappings from MD_LINUX_MAPS (preferred).
     match dump.get_stream::<MinidumpLinuxMaps<'_>>() {
         Ok(maps) => {
             let mappings = mappings_from_minidump_linux_maps(&maps)?;
             if v {
-                eprintln!("md2core: MD_LINUX_MAPS: {} file-backed mappings", mappings.len());
+                eprintln!(
+                    "md2core: MD_LINUX_MAPS: {} file-backed mappings",
+                    mappings.len()
+                );
             }
             for mapping in mappings {
                 process.insert_mapping(mapping);
@@ -123,7 +189,17 @@ where
         eprintln!("md2core: MD_LINUX_CMD_LINE: not present");
     }
 
-    // Threads — parse stacks and CPU contexts.
+    Ok(())
+}
+
+fn ingest_threads<'a, T>(
+    dump: &'a Minidump<'a, T>,
+    process: &mut CrashedProcess,
+    system_info: &MinidumpSystemInfo,
+    v: bool,
+) where
+    T: Deref<Target = [u8]> + 'a,
+{
     match dump.get_stream::<MinidumpThreadList<'_>>() {
         Ok(threads) => {
             if v {
@@ -145,7 +221,7 @@ where
                     );
                 }
                 let context = thread
-                    .context(&system_info, None)
+                    .context(system_info, None)
                     .map(|cow| cow.into_owned().raw);
                 process.add_thread(ThreadSnapshot {
                     tid: thread.raw.thread_id,
@@ -161,43 +237,29 @@ where
             }
         }
     }
+}
 
-    // Modules — supplement mappings, build signature substitutions.
-    match dump.get_stream::<MinidumpModuleList>() {
-        Ok(modules) => {
-            if v {
-                eprintln!("md2core: module list: {} modules", modules.iter().count());
-                for m in modules.iter() {
-                    eprintln!(
-                        "md2core:   {:#018x}  {}",
-                        m.raw.base_of_image,
-                        m.name,
-                    );
-                }
-            }
-            ingest_modules(&mut process, &modules, options);
-        }
-        Err(_) => {
-            if v {
-                eprintln!("md2core: module list: not present");
-            }
-        }
-    }
-
-    // Exception — crashing thread + fatal signal + exception CPU context.
+fn ingest_exception<'a, T>(
+    dump: &'a Minidump<'a, T>,
+    process: &mut CrashedProcess,
+    system_info: &MinidumpSystemInfo,
+    v: bool,
+) where
+    T: Deref<Target = [u8]> + 'a,
+{
     match dump.get_stream::<MinidumpException<'_>>() {
         Ok(exception) => {
             if v {
                 eprintln!(
                     "md2core: exception: thread={:#010x} signal={}",
-                    exception.thread_id,
-                    exception.raw.exception_record.exception_code,
+                    exception.thread_id, exception.raw.exception_record.exception_code,
                 );
             }
             process.crashing_tid = Some(exception.thread_id);
-            process.fatal_signal = exception.raw.exception_record.exception_code as i32;
+            process.fatal_signal =
+                i32::from_ne_bytes(exception.raw.exception_record.exception_code.to_ne_bytes());
             process.exception_context = exception
-                .context(&system_info, None)
+                .context(system_info, None)
                 .map(|cow| cow.into_owned().raw);
         }
         Err(_) => {
@@ -206,27 +268,13 @@ where
             }
         }
     }
-
-    // DSO debug — link_map reconstruction.
-    if let Some(bytes) = optional_raw_stream(dump, MINIDUMP_STREAM_TYPE::LinuxDsoDebug)? {
-        if v {
-            eprintln!("md2core: MD_LINUX_DSO_DEBUG: {} bytes", bytes.len());
-        }
-        process.dso_debug = parse_dso_debug(architecture, bytes, full_file)?;
-        if v {
-            eprintln!(
-                "md2core: DSO debug: {} link_map entries",
-                process.dso_debug.link_map.len(),
-            );
-        }
-    } else if v {
-        eprintln!("md2core: MD_LINUX_DSO_DEBUG: not present");
-    }
-
-    Ok(process)
 }
 
 /// Returns a raw stream when present; absent streams produce `None`.
+///
+/// # Errors
+///
+/// Returns an error if the stream exists but cannot be decoded.
 pub fn optional_raw_stream<'a, T>(
     dump: &'a Minidump<'a, T>,
     stream_type: MINIDUMP_STREAM_TYPE,
@@ -243,6 +291,10 @@ where
 
 /// Validates the minidump OS and converts rust-minidump's CPU enum to
 /// md2core's architecture enum.
+///
+/// # Errors
+///
+/// Returns an error if the OS is not Linux/Android/NaCl, or if the CPU is unsupported.
 pub fn architecture_from_system_info(
     system_info: &MinidumpSystemInfo,
 ) -> Result<Architecture, Md2CoreError> {
@@ -250,6 +302,10 @@ pub fn architecture_from_system_info(
 }
 
 /// Converts rust-minidump's CPU/OS pair to a supported md2core architecture.
+///
+/// # Errors
+///
+/// Returns an error if the OS is not Linux/Android/NaCl, or if the CPU is unsupported.
 pub fn architecture_from_cpu_os(cpu: Cpu, os: Os) -> Result<Architecture, Md2CoreError> {
     if !matches!(os, Os::Linux | Os::NaCl | Os::Android) {
         return Err(Md2CoreError::UnsupportedSystem {
@@ -272,6 +328,10 @@ pub fn architecture_from_cpu_os(cpu: Cpu, os: Os) -> Result<Architecture, Md2Cor
 }
 
 /// Converts rust-minidump's typed Linux maps stream into md2core mappings.
+///
+/// # Errors
+///
+/// Returns an error if any map entry cannot be converted into a valid address range.
 pub fn mappings_from_minidump_linux_maps(
     maps: &MinidumpLinuxMaps<'_>,
 ) -> Result<Vec<Mapping>, Md2CoreError> {
@@ -302,14 +362,14 @@ fn ingest_modules(
         // We prefer richer data from MD_LINUX_MAPS; only synthesize a mapping
         // for modules we have not already seen.
         let base = module.raw.base_of_image;
-        let size = module.raw.size_of_image as u64;
+        let size = u64::from(module.raw.size_of_image);
         let name = signature_for(module, options);
-        if size > 0 {
-            if let Ok(mapping) = Mapping::new(base, base + size, MappingPermissions::read_only()) {
-                // Attach the module filename so NT_FILE gets an entry for this
-                // module when MD_LINUX_MAPS is absent or doesn't cover it.
-                process.insert_mapping_if_absent(mapping.with_file(name.clone(), 0));
-            }
+        if size > 0
+            && let Ok(mapping) = Mapping::new(base, base + size, MappingPermissions::read_only())
+        {
+            // Attach the module filename so NT_FILE gets an entry for this
+            // module when MD_LINUX_MAPS is absent or doesn't cover it.
+            process.insert_mapping_if_absent(mapping.with_file(name.clone(), 0));
         }
 
         process.signatures.insert(base, name);
@@ -331,7 +391,8 @@ fn signature_for(module: &MinidumpModule, options: &ConvertOptions) -> String {
     }
 
     // --mangle-sonames: prefix with the build-id GUID.
-    let guid = guid_from_module(module).unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".into());
+    let guid =
+        guid_from_module(module).unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".into());
     if guid == "00000000-0000-0000-0000-000000000000" {
         return filename.clone();
     }
@@ -347,9 +408,17 @@ fn guid_from_module(module: &MinidumpModule) -> Option<String> {
             let g = &pdb.signature;
             Some(format!(
                 "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                g.data1, g.data2, g.data3,
-                g.data4[0], g.data4[1], g.data4[2], g.data4[3],
-                g.data4[4], g.data4[5], g.data4[6], g.data4[7],
+                g.data1,
+                g.data2,
+                g.data3,
+                g.data4[0],
+                g.data4[1],
+                g.data4[2],
+                g.data4[3],
+                g.data4[4],
+                g.data4[5],
+                g.data4[6],
+                g.data4[7],
             ))
         }
         _ => None,
@@ -457,7 +526,7 @@ fn read_link_map_32(
     Ok(entries)
 }
 
-/// Reads an ASCII MDString (UTF-16LE, ASCII-only payload) from `full_file`
+/// Reads an ASCII `MDString` (UTF-16LE, ASCII-only payload) from `full_file`
 /// at the given RVA. Returns `None` if the descriptor is truncated.
 fn read_md_ascii_string(full_file: &[u8], rva: u32) -> Option<String> {
     let off = rva as usize;

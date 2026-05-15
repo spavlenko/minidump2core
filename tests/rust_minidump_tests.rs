@@ -1,6 +1,6 @@
+use md2core::Md2CoreError;
 use md2core::model::Architecture;
 use md2core::rust_minidump::architecture_from_cpu_os;
-use md2core::Md2CoreError;
 use minidump::system_info::{Cpu, Os};
 
 #[test]
@@ -65,8 +65,7 @@ fn unsupported_cpu_returns_error() {
     let result = architecture_from_cpu_os(Cpu::Ppc, Os::Linux);
     assert!(
         matches!(result, Err(Md2CoreError::UnsupportedSystem { .. })),
-        "Ppc CPU should return UnsupportedSystem, got: {:?}",
-        result
+        "Ppc CPU should return UnsupportedSystem, got: {result:?}"
     );
 }
 

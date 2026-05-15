@@ -11,16 +11,18 @@
 
 use std::io::Write;
 
-use crate::elf::{
-    note_types, ElfHeader, ProgramHeader, CORE_NAME, LINUX_NAME, PT_LOAD, PT_NOTE,
-};
+use crate::elf::{CORE_NAME, ElfHeader, LINUX_NAME, PT_LOAD, PT_NOTE, ProgramHeader, note_types};
 use crate::error::Md2CoreError;
-use crate::model::{Architecture, CrashedProcess, ThreadSnapshot, DEFAULT_PAGE_SIZE};
-use minidump::MinidumpRawContext;
-use crate::notes::{build_nt_file_payload, build_prpsinfo, build_prstatus, Note};
+use crate::model::{Architecture, CrashedProcess, DEFAULT_PAGE_SIZE, ThreadSnapshot};
+use crate::notes::{Note, build_nt_file_payload, build_prpsinfo, build_prstatus};
 use crate::regs::{to_fpregset, to_pr_reg, to_prxfpreg};
+use minidump::MinidumpRawContext;
 
 /// Writes the full ELF core image for `process` to `out`.
+///
+/// # Errors
+///
+/// Returns an error if serializing any note or program header fails.
 pub fn write_core<W: Write>(process: &CrashedProcess, out: &mut W) -> Result<(), Md2CoreError> {
     let arch = process.architecture();
 
@@ -29,17 +31,16 @@ pub fn write_core<W: Write>(process: &CrashedProcess, out: &mut W) -> Result<(),
 
     // 2. Compute layout.
     let phnum = 1 /* PT_NOTE */ + process.mappings().len();
-    let phnum_u16 = u16::try_from(phnum).map_err(|_| {
-        Md2CoreError::IntegerOverflow("phnum exceeds u16")
-    })?;
+    let phnum_u16 =
+        u16::try_from(phnum).map_err(|_| Md2CoreError::IntegerOverflow("phnum exceeds u16"))?;
 
     let header = ElfHeader {
         class: arch.elf_class(),
         machine: arch.elf_machine(),
         phnum: phnum_u16,
     };
-    let ehdr_size = header.size() as u64;
-    let phdr_size = header.phdr_size() as u64;
+    let ehdr_size = u64::from(header.size());
+    let phdr_size = u64::from(header.phdr_size());
 
     let phdr_table_size = phdr_size * phnum as u64;
     let pt_note_offset = ehdr_size + phdr_table_size;
@@ -111,7 +112,9 @@ pub fn write_core<W: Write>(process: &CrashedProcess, out: &mut W) -> Result<(),
 
     // 5. Pad to PT_LOAD alignment.
     if note_pad > 0 {
-        let zeros = vec![0u8; note_pad as usize];
+        let note_pad = usize::try_from(note_pad)
+            .map_err(|_| Md2CoreError::IntegerOverflow("PT_NOTE padding"))?;
+        let zeros = vec![0u8; note_pad];
         out.write_all(&zeros)?;
     }
 
@@ -142,16 +145,16 @@ fn build_note_segment(process: &CrashedProcess) -> Result<Vec<u8>, Md2CoreError>
 
     // NT_FILE — lets GDB validate PIE displacement and locate .so symbol files
     // automatically, matching C++ commit 417f5dbd.
-    let nt_file = build_nt_file_payload(arch, process.mappings());
+    let nt_file = build_nt_file_payload(arch, process.mappings())?;
     Note::build(CORE_NAME, note_types::NT_FILE, &nt_file)?.write(&mut out)?;
 
     // NT_PRSTATUS for crashing thread first, then the rest.
     let crashing = process.crashing_tid;
     let mut ordered: Vec<&ThreadSnapshot> = Vec::with_capacity(process.threads().len());
-    if let Some(tid) = crashing {
-        if let Some(t) = process.threads().iter().find(|t| t.tid == tid) {
-            ordered.push(t);
-        }
+    if let Some(tid) = crashing
+        && let Some(t) = process.threads().iter().find(|t| t.tid == tid)
+    {
+        ordered.push(t);
     }
     for thread in process.threads() {
         if Some(thread.tid) != crashing {
@@ -161,7 +164,11 @@ fn build_note_segment(process: &CrashedProcess) -> Result<Vec<u8>, Md2CoreError>
 
     for (index, thread) in ordered.iter().enumerate() {
         let signal = if index == 0 { process.fatal_signal } else { 0 };
-        let context_override = if index == 0 { process.exception_context.as_ref() } else { None };
+        let context_override = if index == 0 {
+            process.exception_context.as_ref()
+        } else {
+            None
+        };
         write_thread_notes(arch, thread, signal, context_override, &mut out)?;
     }
 
