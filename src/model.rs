@@ -222,6 +222,8 @@ pub struct ProcessInfo {
     pub filename: [u8; 16],
     /// Flattened command line, matching `pr_psargs[80]`.
     pub arguments: [u8; 80],
+    /// Process ID used for `pr_pid` in the prpsinfo note.
+    pub pid: u32,
 }
 
 impl ProcessInfo {
@@ -231,6 +233,23 @@ impl ProcessInfo {
         Self {
             filename: [0; 16],
             arguments: [0; 80],
+            pid: 0,
+        }
+    }
+
+    /// Sets `pr_fname` and `pr_psargs` from the basename of `module_path` when
+    /// no command-line stream was available (i.e. `filename` is still zeroed).
+    pub fn apply_module_name_fallback(&mut self, module_path: &str) {
+        if self.filename != [0u8; 16] {
+            return; // already set by cmdline stream
+        }
+        let basename = module_path.rsplit('/').next().unwrap_or(module_path);
+        let bytes = basename.as_bytes();
+        let copy_len = bytes.len().min(15);
+        self.filename[..copy_len].copy_from_slice(&bytes[..copy_len]);
+        if self.arguments == [0u8; 80] {
+            let arg_len = bytes.len().min(79);
+            self.arguments[..arg_len].copy_from_slice(&bytes[..arg_len]);
         }
     }
 
@@ -384,6 +403,14 @@ impl CrashedProcess {
     /// Updates process info from the Linux command-line stream.
     pub fn apply_cmdline(&mut self, cmdline: &[u8]) {
         self.process_info.apply_cmdline(cmdline);
+    }
+    /// Sets the process ID used in `NT_PRPSINFO`.
+    pub fn set_pid(&mut self, pid: u32) {
+        self.process_info.pid = pid;
+    }
+    /// Sets `pr_fname`/`pr_psargs` from a module path when cmdline is absent.
+    pub fn apply_module_name_fallback(&mut self, module_path: &str) {
+        self.process_info.apply_module_name_fallback(module_path);
     }
     /// Returns process info note data.
     #[must_use]

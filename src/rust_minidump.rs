@@ -111,6 +111,14 @@ where
 
     ingest_exception(dump, &mut process, &system_info, v);
 
+    // Set PID from the crashing thread (or first thread if no exception).
+    // On Linux the main thread's TID == the process's PID.
+    let pid = process
+        .crashing_tid
+        .or_else(|| process.threads().first().map(|t| t.tid))
+        .unwrap_or(0);
+    process.set_pid(pid);
+
     // DSO debug — link_map reconstruction.
     if let Some(bytes) = optional_raw_stream(dump, MINIDUMP_STREAM_TYPE::LinuxDsoDebug)? {
         if v {
@@ -123,8 +131,31 @@ where
                 process.dso_debug.link_map.len(),
             );
         }
-    } else if v {
-        eprintln!("md2core: MD_LINUX_DSO_DEBUG: not present");
+    } else {
+        if v {
+            eprintln!("md2core: MD_LINUX_DSO_DEBUG: not present");
+        }
+        // Fall back: synthesize r_debug from the on-disk executable so GDB can
+        // auto-load shared libraries without needing add-symbol-file.
+        if let Ok(modules) = dump.get_stream::<MinidumpModuleList>() {
+            if let Some(dso) = synthesize_dso_debug(architecture, &modules, &process.signatures, v)
+            {
+                process.dso_debug = dso;
+            }
+
+            // Synthesize NT_AUXV (AT_PHDR + AT_ENTRY) so GDB can compute the
+            // PIE exec_displacement and apply the correct symbol base address.
+            // Without this, GDB shows symbols at their ELF-file vaddrs (no
+            // relocation applied) and the SVR4 r_debug solib discovery fails.
+            if process.auxv().is_empty()
+                && let Some(auxv) = build_synthetic_auxv(architecture, &modules)
+            {
+                if v {
+                    eprintln!("md2core: synthesized NT_AUXV ({} bytes)", auxv.len());
+                }
+                process.set_auxv(auxv);
+            }
+        }
     }
 
     Ok(process)
@@ -374,6 +405,16 @@ fn ingest_modules(
 
         process.signatures.insert(base, name);
     }
+
+    // If no cmdline stream was present (pr_fname still zeroed), use the first
+    // module that looks like a main executable (no ".so" suffix).
+    for module in modules.iter() {
+        let basename = module.name.rsplit('/').next().unwrap_or(&module.name);
+        if !looks_like_shared_lib(basename) {
+            process.apply_module_name_fallback(&module.name);
+            break;
+        }
+    }
 }
 
 fn signature_for(module: &MinidumpModule, options: &ConvertOptions) -> String {
@@ -423,6 +464,396 @@ fn guid_from_module(module: &MinidumpModule) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Returns `true` when `basename` looks like a dynamic library name
+/// (e.g. `libc.so.6`, `libfoo.so`, `linux-vdso.so.1`).
+fn looks_like_shared_lib(basename: &str) -> bool {
+    // Match names that end with ".so" or ".so.<digits...>" anywhere in the suffix.
+    // Examples that match: libc.so.6, libm.so, linux-vdso.so.1
+    // Examples that don't: test_app_cmd, my_binary
+    let bytes = basename.as_bytes();
+    // Walk backwards: skip a trailing version string like ".6" then look for ".so".
+    let mut i = bytes.len();
+    // Optional trailing version: skip trailing ".<decimal>" segments
+    loop {
+        // Find the last '.'
+        let dot_pos = bytes[..i].iter().rposition(|&b| b == b'.');
+        let Some(pos) = dot_pos else { return false };
+        let suffix = &bytes[pos + 1..i];
+        if suffix == b"so" {
+            return true;
+        }
+        if suffix.iter().all(u8::is_ascii_digit) {
+            i = pos; // strip this version segment and keep looking
+        } else {
+            return false;
+        }
+    }
+}
+
+/// Attempts to synthesize a [`DsoDebug`] from the module list when the minidump
+/// has no `MD_LINUX_DSO_DEBUG` stream.
+///
+/// Strategy:
+/// 1. Find the first non-library module in the module list (the main executable).
+///    The executable does *not* need to be accessible on disk; the link map is
+///    built from the minidump module list regardless.
+/// 2. If the executable *is* accessible, read its ELF `PT_DYNAMIC` section so
+///    `DT_DEBUG` can be patched to point GDB at the rebuilt link map.
+/// 3. Build a `link_map` from all modules with correct `l_ld` values.
+///    GDB's `lm_addr_check` computes the solib load displacement as
+///    `l_ld − file_PT_DYNAMIC_vaddr`.  When `l_ld = 0` this yields a large
+///    negative displacement and all symbol lookups land at wrong addresses.
+///    Reading each module's ELF (if accessible) and computing
+///    `l_ld = load_base + PT_DYNAMIC_vaddr` fixes this.
+fn synthesize_dso_debug(
+    arch: Architecture,
+    modules: &MinidumpModuleList,
+    signatures: &std::collections::BTreeMap<u64, String>,
+    v: bool,
+) -> Option<DsoDebug> {
+    // Find the first non-library module.  No disk access required here.
+    let (exe_base, exe_path) = modules.iter().find_map(|m| {
+        let basename = m.name.rsplit('/').next().unwrap_or(&m.name);
+        if looks_like_shared_lib(basename) {
+            return None;
+        }
+        Some((m.raw.base_of_image, m.name.clone()))
+    })?;
+
+    // Try to read PT_DYNAMIC from the executable.  If the file is not locally
+    // accessible (analysing a dump from another machine), fall back to an
+    // estimated load_bias and skip DT_DEBUG patching.
+    let (dynamic_data, dynamic_addr, load_bias) =
+        read_executable_dynamic(arch, &exe_path, exe_base)
+            .unwrap_or_else(|| (Vec::new(), 0, exe_base));
+
+    if v {
+        eprintln!(
+            "md2core: synthesize DSO debug: exe={exe_path} load_bias={load_bias:#x} \
+             _DYNAMIC@{dynamic_addr:#x} ({} bytes)",
+            dynamic_data.len()
+        );
+    }
+
+    // Build link_map with correct l_ld for each module.
+    // l_ld = load_base + PT_DYNAMIC_vaddr (derived from the module's ELF file
+    // when accessible).  Returns 0 for modules whose files cannot be read;
+    // those modules will have degraded symbol resolution in GDB.
+    let link_map: Vec<LinkMapEntry> = modules
+        .iter()
+        .map(|m| {
+            let addr = m.raw.base_of_image;
+            // `name` is the signatures-resolved path (respects --sobasedir).
+            let name = signatures
+                .get(&addr)
+                .cloned()
+                .unwrap_or_else(|| m.name.clone());
+            // Use the resolved `name` (not the raw `m.name`) so that
+            // --sobasedir-rewritten paths are tried.  Also falls back to
+            // standard system library directories for bare sonames.
+            let ld = elf_dynamic_runtime_addr(arch, &name, addr).unwrap_or(0);
+            LinkMapEntry { addr, ld, name }
+        })
+        .collect();
+
+    if v {
+        eprintln!(
+            "md2core: synthesize DSO debug: {} link_map entries",
+            link_map.len()
+        );
+    }
+
+    Some(DsoDebug {
+        version: 1,
+        brk: 0,
+        ldbase: load_bias,
+        dynamic: dynamic_addr,
+        link_map,
+        dynamic_data,
+    })
+}
+
+/// Returns the runtime address of the `_DYNAMIC` segment for the ELF module
+/// loaded at `load_base`, or `None` when the file cannot be read.
+///
+/// GDB stores this value as `l_ld` in the `link_map` struct.  Its
+/// `lm_addr_check` function derives the solib load displacement as:
+///
+/// ```text
+/// displacement = l_ld − file_PT_DYNAMIC_vaddr
+/// ```
+///
+/// When `l_ld = 0` this becomes `−file_PT_DYNAMIC_vaddr` (wrong sign),
+/// placing all symbol lookups at garbage addresses.  Providing the correct
+/// value fixes symbol resolution without requiring core memory at those
+/// addresses.
+fn elf_dynamic_runtime_addr(arch: Architecture, path: &str, load_base: u64) -> Option<u64> {
+    // Try to locate the file.  If `path` is not found directly, fall back to
+    // searching for the basename in standard system library directories.  This
+    // handles both bare names ("libc.so.6") and --sobasedir-rewritten paths
+    // ("/app/dir/libc.so.6") when the app dir contains only app-specific libs.
+    let bytes = if std::fs::metadata(path).is_ok() {
+        std::fs::read(path).ok()?
+    } else {
+        const SYSTEM_LIB_DIRS: &[&str] = &[
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib",
+            "/lib/x86_64-linux-gnu",
+            "/lib",
+        ];
+        let basename = path.rsplit('/').next().unwrap_or(path);
+        let mut found = None;
+        for dir in SYSTEM_LIB_DIRS {
+            let candidate = format!("{dir}/{basename}");
+            if let Ok(b) = std::fs::read(&candidate) {
+                found = Some(b);
+                break;
+            }
+        }
+        found?
+    };
+    if bytes.get(..4) != Some(b"\x7fELF") {
+        return None;
+    }
+    let is_64 = bytes.get(4).copied()? == 2;
+    if is_64 != arch.is_64bit() {
+        return None;
+    }
+
+    let (e_phoff, e_phentsize, e_phnum) = if is_64 {
+        (
+            usize::try_from(read_u64_le(&bytes, 32)?).ok()?,
+            read_u16_le(&bytes, 54)? as usize,
+            read_u16_le(&bytes, 56)? as usize,
+        )
+    } else {
+        (
+            read_u32_le(&bytes, 28)? as usize,
+            read_u16_le(&bytes, 42)? as usize,
+            read_u16_le(&bytes, 44)? as usize,
+        )
+    };
+
+    let mut first_load_vaddr: Option<u64> = None;
+    let mut dyn_vaddr: Option<u64> = None;
+
+    for i in 0..e_phnum {
+        let o = e_phoff.checked_add(i.checked_mul(e_phentsize)?)?;
+        let p_type = read_u32_le(&bytes, o)?;
+        let p_vaddr = if is_64 {
+            read_u64_le(&bytes, o + 16)?
+        } else {
+            u64::from(read_u32_le(&bytes, o + 8)?)
+        };
+        match p_type {
+            1 /* PT_LOAD */ => { first_load_vaddr.get_or_insert(p_vaddr); }
+            2 /* PT_DYNAMIC */ => { dyn_vaddr = Some(p_vaddr); }
+            _ => {}
+        }
+    }
+
+    let load_bias = load_base.checked_sub(first_load_vaddr?)?;
+    load_bias.checked_add(dyn_vaddr?)
+}
+
+/// Reads the `PT_DYNAMIC` segment from an ELF executable at `exe_path` that
+/// was loaded at `load_base`.
+///
+/// Returns `(dynamic_bytes, runtime_dynamic_addr, load_bias)` on success.
+/// All errors are silently suppressed and produce `None`.
+fn read_executable_dynamic(
+    arch: Architecture,
+    exe_path: &str,
+    load_base: u64,
+) -> Option<(Vec<u8>, u64, u64)> {
+    let bytes = std::fs::read(exe_path).ok()?;
+    if bytes.get(..4) != Some(b"\x7fELF") {
+        return None;
+    }
+    let is_64 = bytes.get(4).copied()? == 2;
+    if is_64 != arch.is_64bit() {
+        return None;
+    }
+
+    let (e_phoff, e_phentsize, e_phnum) = if is_64 {
+        (
+            usize::try_from(read_u64_le(&bytes, 32)?).ok()?,
+            read_u16_le(&bytes, 54)? as usize,
+            read_u16_le(&bytes, 56)? as usize,
+        )
+    } else {
+        (
+            read_u32_le(&bytes, 28)? as usize,
+            read_u16_le(&bytes, 42)? as usize,
+            read_u16_le(&bytes, 44)? as usize,
+        )
+    };
+
+    let mut first_load_vaddr: Option<u64> = None;
+    let mut dyn_info: Option<(u64, u64, u64)> = None; // (file_off, vaddr, size)
+
+    for i in 0..e_phnum {
+        let o = e_phoff.checked_add(i.checked_mul(e_phentsize)?)?;
+        let p_type = read_u32_le(&bytes, o)?;
+        let (p_offset, p_vaddr, p_filesz) = if is_64 {
+            (
+                read_u64_le(&bytes, o + 8)?,
+                read_u64_le(&bytes, o + 16)?,
+                read_u64_le(&bytes, o + 32)?,
+            )
+        } else {
+            (
+                u64::from(read_u32_le(&bytes, o + 4)?),
+                u64::from(read_u32_le(&bytes, o + 8)?),
+                u64::from(read_u32_le(&bytes, o + 16)?),
+            )
+        };
+        match p_type {
+            1 /* PT_LOAD */ => {
+                first_load_vaddr.get_or_insert(p_vaddr);
+            }
+            2 /* PT_DYNAMIC */ => {
+                dyn_info = Some((p_offset, p_vaddr, p_filesz));
+            }
+            _ => {}
+        }
+    }
+
+    let first_load_vaddr = first_load_vaddr?;
+    let (dyn_file_off, dyn_vaddr, dyn_size) = dyn_info?;
+    let load_bias = load_base.checked_sub(first_load_vaddr)?;
+    let runtime_dyn = dyn_vaddr.checked_add(load_bias)?;
+
+    let start = usize::try_from(dyn_file_off).ok()?;
+    let end = start.checked_add(usize::try_from(dyn_size).ok()?)?;
+    if end > bytes.len() {
+        return None;
+    }
+
+    Some((bytes[start..end].to_vec(), runtime_dyn, load_bias))
+}
+
+// ---------------------------------------------------------------------------
+// Byte-level helpers for safe little-endian reads from a byte slice.
+// ---------------------------------------------------------------------------
+
+fn read_u16_le(bytes: &[u8], off: usize) -> Option<u16> {
+    bytes
+        .get(off..off + 2)
+        .and_then(|s| s.try_into().ok())
+        .map(u16::from_le_bytes)
+}
+
+fn read_u32_le(bytes: &[u8], off: usize) -> Option<u32> {
+    bytes
+        .get(off..off + 4)
+        .and_then(|s| s.try_into().ok())
+        .map(u32::from_le_bytes)
+}
+
+fn read_u64_le(bytes: &[u8], off: usize) -> Option<u64> {
+    bytes
+        .get(off..off + 8)
+        .and_then(|s| s.try_into().ok())
+        .map(u64::from_le_bytes)
+}
+
+/// Builds a minimal synthetic `NT_AUXV` payload containing `AT_PHDR` and
+/// `AT_ENTRY`, which GDB needs to compute `exec_displacement` for PIE
+/// executables loaded from coredumps.
+///
+/// Without these entries GDB assumes displacement = 0 and shows symbols at
+/// their ELF-file virtual addresses rather than their runtime addresses.
+fn build_synthetic_auxv(arch: Architecture, modules: &MinidumpModuleList) -> Option<Vec<u8>> {
+    // Find the main executable: first non-.so module with an on-disk path.
+    let (exe_base, exe_path) = modules.iter().find_map(|m| {
+        let basename = m.name.rsplit('/').next().unwrap_or(&m.name);
+        if looks_like_shared_lib(basename) {
+            return None;
+        }
+        if std::fs::metadata(&m.name).is_err() {
+            return None;
+        }
+        Some((m.raw.base_of_image, m.name.clone()))
+    })?;
+
+    let bytes = std::fs::read(&exe_path).ok()?;
+    if bytes.get(..4) != Some(b"\x7fELF") {
+        return None;
+    }
+    let is_64 = bytes.get(4).copied()? == 2;
+    if is_64 != arch.is_64bit() {
+        return None;
+    }
+
+    let e_entry: u64 = if is_64 {
+        read_u64_le(&bytes, 24)?
+    } else {
+        u64::from(read_u32_le(&bytes, 24)?)
+    };
+
+    let (e_phoff, e_phentsize, e_phnum) = if is_64 {
+        (
+            usize::try_from(read_u64_le(&bytes, 32)?).ok()?,
+            read_u16_le(&bytes, 54)? as usize,
+            read_u16_le(&bytes, 56)? as usize,
+        )
+    } else {
+        (
+            read_u32_le(&bytes, 28)? as usize,
+            read_u16_le(&bytes, 42)? as usize,
+            read_u16_le(&bytes, 44)? as usize,
+        )
+    };
+
+    let mut first_load_vaddr: Option<u64> = None;
+    let mut pt_phdr_vaddr: Option<u64> = None;
+
+    for i in 0..e_phnum {
+        let o = e_phoff.checked_add(i.checked_mul(e_phentsize)?)?;
+        let p_type = read_u32_le(&bytes, o)?;
+        let p_vaddr = if is_64 {
+            read_u64_le(&bytes, o + 16)?
+        } else {
+            u64::from(read_u32_le(&bytes, o + 8)?)
+        };
+        match p_type {
+            1 /* PT_LOAD */ => { first_load_vaddr.get_or_insert(p_vaddr); }
+            6 /* PT_PHDR */ => { pt_phdr_vaddr = Some(p_vaddr); }
+            _ => {}
+        }
+    }
+
+    let first_load_vaddr = first_load_vaddr?;
+    let load_bias = exe_base.checked_sub(first_load_vaddr)?;
+
+    // AT_PHDR: runtime address of the program-header table.
+    let phdr_vaddr = pt_phdr_vaddr.unwrap_or(e_phoff as u64);
+    let at_phdr = load_bias.checked_add(phdr_vaddr)?;
+    let at_entry = load_bias.checked_add(e_entry)?;
+
+    let word = arch.long_size();
+    let mut out = Vec::with_capacity(3 * 2 * word);
+
+    // Each auxv entry is { a_type, a_val }, both word-sized, little-endian.
+    if is_64 {
+        for (typ, val) in [(3u64, at_phdr), (9u64, at_entry), (0u64, 0u64)] {
+            out.extend_from_slice(&typ.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+    } else {
+        // For 32-bit ELF, AT_ values and load addresses are 32-bit by construction.
+        let at_phdr32 = u32::try_from(at_phdr).ok()?;
+        let at_entry32 = u32::try_from(at_entry).ok()?;
+        for (typ, val) in [(3u32, at_phdr32), (9u32, at_entry32), (0u32, 0u32)] {
+            out.extend_from_slice(&typ.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+    }
+
+    Some(out)
 }
 
 /// `MDRVA` sentinel from the minidump format meaning "no link map present".

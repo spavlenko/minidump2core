@@ -57,6 +57,20 @@ pub fn write_core<W: Write>(process: &CrashedProcess, out: &mut W) -> Result<(),
     };
     let mut load_offset = pt_note_end + note_pad;
 
+    // Compute total file size so empty PT_LOAD segments can use an
+    // out-of-file `p_offset`. Setting `p_offset = 0` for empty segments
+    // (as Breakpad's C++ tool does) makes recent GDB/BFD versions re-scan
+    // the ELF header / PT_NOTE region for every such segment, producing a
+    // long sequence of `[LWP X exited][New LWP X]` events and inflated
+    // thread numbering. Pointing empty segments past the end of the file
+    // avoids any overlap with real data.
+    let total_data: u64 = process
+        .mappings()
+        .values()
+        .map(|m| m.data.len() as u64)
+        .sum();
+    let empty_load_offset = load_offset + total_data;
+
     // 3. Write Ehdr + Phdrs.
     header.write(out)?;
 
@@ -78,7 +92,7 @@ pub fn write_core<W: Write>(process: &CrashedProcess, out: &mut W) -> Result<(),
         let memsz = mapping.end_address - mapping.start_address;
         let (p_offset, p_filesz);
         if mapping.data.is_empty() {
-            p_offset = 0;
+            p_offset = empty_load_offset;
             p_filesz = 0;
         } else {
             p_offset = load_offset;

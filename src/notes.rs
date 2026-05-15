@@ -93,9 +93,10 @@ pub fn build_prpsinfo(arch: Architecture, info: &ProcessInfo) -> Vec<u8> {
         out.extend_from_slice(&0u16.to_le_bytes());
     }
 
-    for _ in 0..4 {
-        out.extend_from_slice(&0i32.to_le_bytes()); // pids
-    }
+    out.extend_from_slice(&i32::from_ne_bytes(info.pid.to_ne_bytes()).to_le_bytes()); // pr_pid
+    out.extend_from_slice(&0i32.to_le_bytes()); // pr_ppid
+    out.extend_from_slice(&0i32.to_le_bytes()); // pr_pgrp
+    out.extend_from_slice(&0i32.to_le_bytes()); // pr_sid
     out.extend_from_slice(&info.filename);
     out.extend_from_slice(&info.arguments);
     out
@@ -207,7 +208,10 @@ pub fn build_nt_file_payload(
             "NT_FILE mapping start",
         )?;
         try_push_long(&mut out, mapping.end_address, word, "NT_FILE mapping end")?;
-        try_push_long(&mut out, mapping.offset, word, "NT_FILE mapping offset")?;
+        // NT_FILE stores offsets in PAGE units (kernel vm_pgoff); GDB multiplies
+        // by page_size to recover the byte offset.
+        let page_ofs = mapping.offset / DEFAULT_PAGE_SIZE;
+        try_push_long(&mut out, page_ofs, word, "NT_FILE mapping offset")?;
     }
     for (_, filename) in &entries {
         out.extend_from_slice(filename.as_bytes());

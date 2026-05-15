@@ -18,3 +18,9 @@ All notable changes to this project will be documented in this file.
 - `DT_DEBUG` patching in `.dynamic` so GDB can walk the shared-library link map
 - Integration test suite covering model layout, note alignment, ELF headers, register serialization, maps parsing, augmentation, and minidump parsing
 
+### Fixed
+
+- Synthesized `NT_AUXV` for PIE dumps so GDB computes the correct executable displacement
+- Reconstructed `link_map` entries now carry the correct `l_ld` so GDB resolves shared-library symbols at the right addresses
+- DSO debug synthesis no longer hard-requires the main executable to be present on disk
+
