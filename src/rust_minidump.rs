@@ -97,7 +97,7 @@ where
             if v {
                 eprintln!("md2core: module list: {} modules", modules.iter().count());
                 for m in modules.iter() {
-                    eprintln!("md2core:   {:#018x}  {}", m.raw.base_of_image, m.name,);
+                    eprintln!("md2core:   {:#018x}  {}", m.raw.base_of_image, m.name);
                 }
             }
             ingest_modules(&mut process, &modules, options);
