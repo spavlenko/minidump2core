@@ -1,0 +1,76 @@
+name: Bug Report
+description: Report a bug or incorrect behavior in md2core
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill out the fields below as completely as possible.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of the bug.
+      placeholder: What went wrong?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Step-by-step instructions to reproduce the issue.
+      placeholder: |
+        1. Run `minidump-2-core ...`
+        2. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened? Include any error messages or output.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Minidump Architecture
+      description: Target architecture of the minidump file.
+      options:
+        - x86
+        - x86-64
+        - ARM
+        - AArch64
+        - MIPS
+        - MIPS64
+        - Unknown / Other
+    validations:
+      required: false
+
+  - type: input
+    id: os
+    attributes:
+      label: Minidump OS
+      description: Operating system the minidump was captured on (e.g. Linux, Android).
+      placeholder: Linux
+
+  - type: input
+    id: version
+    attributes:
+      label: Tool Version
+      description: Output of `minidump-2-core --version`.
+      placeholder: minidump-2-core 0.1.0
+    validations:
+      required: false

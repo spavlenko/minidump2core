@@ -1,0 +1,31 @@
+[package]
+name = "minidump2core"
+version = "0.1.0"
+edition = "2024"
+description = "Safe Rust port of Breakpad's minidump-2-core tool"
+license = "BSD-3-Clause"
+keywords = ["minidump", "coredump", "breakpad", "linux", "debugger"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+rust-version = "1.75"
+repository = "https://github.com/spavlenko/minidump2core"
+
+[[bin]]
+name = "minidump-2-core"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+minidump = "0.26.1"
+minidump-common = "0.26.1"
+procfs-core = { version = "0.18", default-features = false }
+scroll = "0.13.0"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = "warn"
